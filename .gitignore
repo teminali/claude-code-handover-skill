@@ -1,0 +1,5 @@
+state/
+config.json
+docs/*.local.md
+__pycache__/
+.DS_Store
