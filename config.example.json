@@ -10,6 +10,8 @@
     "critical": 0.85
   },
   "block_at_critical": true,
+  "block_at_red": false,
+  "renotify_tokens": 25000,
   "big_tool_result_tokens": 25000,
   "min_growth_bytes": 40000,
   "share_dir": "",
