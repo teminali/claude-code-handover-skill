@@ -97,12 +97,55 @@ The baseline is read from the session's own first request, not assumed. Dollar
 figures are list price at the cache-read rate — on a subscription plan the real
 currency is your usage allowance, and the token counts are the honest number.
 
+## What it actually saved
+
+`savings` projects forward. `savings --all` looks backwards and measures what the
+handovers you have already written did save:
+
+```
+$ python3 ~/.claude/handover/bin/ctx.py savings --all
+
+Realized handover savings - 4 of 8 handovers picked up
+
+  project          written     ctx@handover fresh start  turns     saved
+  project-a        09-02 16:22      228,897      39,889    136     25.7M
+  project-b        09-02 16:34      623,451      41,769    199    115.8M
+  project-a        09-02 18:01      177,181      40,056    139     19.1M
+  project-a        09-02 18:24      186,487      43,214    126     18.1M
+
+  tokens not re-sent : 178.6M
+  at list price      : $89.29 (cache-read rate)
+```
+
+It reads every handover doc it can reach — this project, the share folder, and every
+project directory any local transcript was recorded in — pulls `context_at_handover`
+from the frontmatter, then finds the fresh session that picked each one up and reads
+that session's own first request as the real baseline. Saving is
+`(context_at_handover - fresh_start) x turns since`.
+
+Two rules keep the number honest:
+
+- A session counts as a pickup only if it names the doc **within its first few turns**
+  (`--window`, default 3). A session that merely mentions a handover later — one
+  analysing them, for instance — is not counted.
+- Each fresh session is credited **once**, to the newest doc it read, so a chain of
+  superseded handovers cannot bill the same turns twice.
+
+Anything it cannot trace is listed separately rather than assumed. `ctx.py consume`
+now stamps the consuming session id into the doc, which makes attribution exact
+instead of heuristic. Add `--json` for a machine-readable version, `--days N` to
+limit the window.
+
+The total is a floor: it assumes the old session's context would have stayed flat at
+its handover size, when in reality it kept growing every turn.
+
 ## Commands
 
 ```bash
 ctx=~/.claude/handover/bin/ctx.py
 python3 $ctx status            # context size and band for this session
 python3 $ctx savings           # what a handover would save, right now
+python3 $ctx savings --all     # what the handovers you already wrote did save
 python3 $ctx report --days 7   # where tokens actually went, across all sessions
 python3 $ctx facts             # prompts, files, commands, todos, git state
 python3 $ctx list              # handovers for this project, from every machine
