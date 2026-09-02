@@ -32,7 +32,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 HOME = Path.home()
 ROOT = Path(os.environ.get("CLAUDE_HANDOVER_ROOT", str(HOME / ".claude" / "handover")))
 STATE_DIR = ROOT / "state"
@@ -48,6 +48,10 @@ DEFAULT_CONFIG = {
     # ...but also trip relative to a small window (200k models)
     "pct_of_window": {"red": 0.70, "critical": 0.85},
     "block_at_critical": True,
+    "block_at_red": False,       # RED nags hard but does not block by default
+    # a single nudge per band is easy to scroll past - re-warn every N tokens of
+    # further growth inside the same band
+    "renotify_tokens": 25000,
     "big_tool_result_tokens": 25000,
     "min_growth_bytes": 40000,   # skip re-reading transcript until it grows this much
     "share_dir": "",             # e.g. ~/Library/Mobile Documents/com~apple~CloudDocs/claude-handovers
@@ -272,25 +276,71 @@ def emit(obj: dict) -> None:
 # ------------------------------------------------------------------ guard ---
 GUARD_TEXT = {
     "amber": (
-        "CONTEXT GUARD - AMBER ({tok} tokens in context, ~{cost}x the cost of a fresh turn).\n"
+        "CONTEXT GUARD - AMBER ({tok} tokens in context, ~{cost}x the cost of a fresh turn).{since}\n"
         "Finish the step you are on. Do not open new workstreams, do not spawn subagents, "
         "and prefer targeted `grep`/`sed -n` over reading whole files. "
-        "If a new task is coming, say so and offer to run the `handover` skill first."
+        "If a new task is coming, say so and offer to run the `handover` skill first.{drift}"
     ),
     "red": (
-        "CONTEXT GUARD - RED ({tok} tokens in context). Every further turn re-sends all of it.\n"
+        "CONTEXT GUARD - RED ({tok} tokens in context). Every further turn re-sends all of it.{since}\n"
         "STOP starting new work now. Complete only the edit in flight, then invoke the "
         "`handover` skill (Skill tool, skill: \"handover\"). It writes a handover doc plus a "
         "paste-ready prompt so a fresh session can continue at a fraction of the cost. "
-        "Do not read more files, run broad searches, or spawn subagents before that."
+        "Do not read more files, run broad searches, or spawn subagents before that.{drift}"
     ),
     "critical": (
-        "CONTEXT GUARD - CRITICAL ({tok} tokens in context). This turn is expensive and quality degrades.\n"
+        "CONTEXT GUARD - CRITICAL ({tok} tokens in context). This turn is expensive and quality degrades.{since}\n"
         "HARD STOP on new work. Do not run further exploratory tools. Immediately invoke the "
         "`handover` skill (Skill tool, skill: \"handover\") to write the handover doc and the "
-        "new-chat prompt, tell the user to start a fresh session, and end the turn."
+        "new-chat prompt, tell the user to start a fresh session, and end the turn.{drift}"
     ),
 }
+
+# Shown once a handover doc exists for this session: keep nagging, stop blocking,
+# so complying with the guard cannot wedge the session.
+DONE_TEXT = (
+    "CONTEXT GUARD - a handover for this session is already written ({doc}), and context has "
+    "grown to {tok} tokens since.\n"
+    "Do not start new work here. Tell the user to open a fresh session and paste the start-here "
+    "prompt. If work continued past the handover, re-run the `handover` skill before they switch "
+    "so the doc is not stale."
+)
+
+
+def fire_point_drift(cfg: dict, cwd: str, limit: int = 8) -> str:
+    """Feedback on where past handovers actually fired, versus AMBER.
+
+    A guard that gets ignored until 250k is a guard that is not working. Telling
+    the session its own median overshoot is what closes that loop."""
+    try:
+        docs, seen = [], set()
+        dirs = [handover_dir(cwd)]
+        sd = share_dir(cfg)
+        if sd:
+            dirs.append(sd)
+        for d in dirs:
+            if not d or not d.exists():
+                continue
+            for f in d.rglob("HANDOVER-*.md"):
+                if f.name in seen:
+                    continue
+                seen.add(f.name)
+                h = parse_handover(f)
+                if h:
+                    docs.append(h)
+        if len(docs) < 3:
+            return ""
+        docs.sort(key=lambda h: h["mtime"], reverse=True)
+        pts = sorted(h["context"] for h in docs[:limit])
+        med = pts[len(pts) // 2]
+        amber = cfg["thresholds"]["amber"]
+        if med <= amber * 1.15:
+            return ""
+        return ("\nYour last %d handovers fired at a median of %s - %s past AMBER (%s). "
+                "That overshoot is the expensive part. Hand over near AMBER, not at the block."
+                % (len(pts), fmt_tok(med), fmt_tok(med - amber), fmt_tok(amber)))
+    except Exception:
+        return ""
 
 
 def cmd_guard(payload: dict) -> int:
@@ -326,28 +376,58 @@ def cmd_guard(payload: dict) -> int:
 
     prev_tokens = st.get("tokens", 0)
     fired = st.get("fired", [])
-    # context dropped a lot -> compaction or /clear: re-arm every band
+    last_notice = st.get("last_notice_tokens", 0)
+    # context dropped a lot -> compaction or /clear: re-arm every band, and drop
+    # the handover stamp - a fresh context is a new session in spirit
     if prev_tokens and tokens < prev_tokens * 0.7:
         fired = []
+        last_notice = 0
+        st.pop("handover_doc", None)
+        st.pop("handover_at", None)
     st["tokens"] = tokens
     st["band"] = band
     st["window"] = window
     st["updated"] = time.time()
 
-    if band == "green" or band in fired:
+    if band == "green":
         st["fired"] = fired
         save_state(session_id, st)
         return 0
 
-    fired.append(band)
+    # One nudge per band was too easy to scroll past: sessions took the AMBER
+    # warning and still drifted 60-100k beyond it before handing over. Re-warn on
+    # every further chunk of growth, so the cost stays in front of the model.
+    renotify = max(5000, int(cfg.get("renotify_tokens", 25000)))
+    new_band = band not in fired
+    if not new_band and tokens - last_notice < renotify:
+        st["fired"] = fired
+        save_state(session_id, st)
+        return 0
+
+    if new_band:
+        fired.append(band)
     st["fired"] = fired
+    st["last_notice_tokens"] = tokens
     save_state(session_id, st)
 
     ratio = max(1, round(tokens / 15000))
-    text = GUARD_TEXT[band].format(tok=f"{tokens:,}", cost=ratio)
+    since = ""
+    if last_notice and tokens > last_notice:
+        since = (" %s more since the last warning, and all of it is re-sent every turn."
+                 % fmt_tok(tokens - last_notice))
+    done_doc = st.get("handover_doc")
+    if done_doc:
+        text = DONE_TEXT.format(doc=Path(done_doc).name, tok=f"{tokens:,}")
+    else:
+        text = GUARD_TEXT[band].format(
+            tok=f"{tokens:,}", cost=ratio, since=since,
+            drift=fire_point_drift(cfg, payload.get("cwd") or os.getcwd()),
+        )
     pct = 100.0 * tokens / window
     ui = f"context {fmt_tok(tokens)}/{fmt_tok(window)} ({pct:.0f}%) - {band.upper()}"
-    if band == "amber":
+    if done_doc:
+        ui += " - handover written, start a fresh session"
+    elif band == "amber":
         ui += " - wrap up the current step"
     elif band == "red":
         ui += " - /handover recommended"
@@ -358,7 +438,14 @@ def cmd_guard(payload: dict) -> int:
         "systemMessage": ui,
         "hookSpecificOutput": {"hookEventName": event, "additionalContext": text},
     }
-    if band == "critical" and cfg.get("block_at_critical", True) and event == "PostToolUse":
+    # Block every time we are over the line, not only the first time. The old
+    # one-shot block was a speed bump: a session blocked once at 220k and then ran
+    # on to 280k unimpeded. Writing the handover lifts the block.
+    blocking = event == "PostToolUse" and not done_doc and (
+        (band == "critical" and cfg.get("block_at_critical", True))
+        or (band == "red" and cfg.get("block_at_red", False))
+    )
+    if blocking:
         out["decision"] = "block"
         out["reason"] = text
     emit(out)
@@ -1188,6 +1275,19 @@ def cmd_write(args: list[str]) -> int:
                 written.append("(copied to clipboard)")
             except Exception:
                 pass
+    # Let the guard in this session know the doc exists: it keeps nagging, but
+    # stops blocking, so following the guard's own instruction cannot wedge a turn.
+    sid = info.get("session_id") or ""
+    if sid:
+        try:
+            stw = load_state(sid)
+            stw["handover_doc"] = str(out)
+            stw["handover_at"] = time.time()
+            stw["handover_tokens"] = info.get("tokens", 0)
+            save_state(sid, stw)
+        except Exception:
+            pass
+
     for w in written:
         print(w)
     if savings:

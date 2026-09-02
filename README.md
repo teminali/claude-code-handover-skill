@@ -68,11 +68,32 @@ absolute context, not percentage of the window:
 |---|---|---|
 | AMBER | 110k | Claude is told to finish the current step and open nothing new |
 | RED | 160k | Claude is told to stop new work and run `/handover` |
-| CRITICAL | 220k | The tool call is blocked and the handover is forced |
+| CRITICAL | 220k | The tool call is blocked, every time, until the handover is written |
 
-Each band fires once per session and re-arms if context drops after a `/clear` or a
-compaction. Between checks the guard costs one `stat()` call — it only re-reads the
-transcript once it has grown by 40 KB.
+A band fires when it is first crossed and **again on every further 25k of growth**
+(`renotify_tokens`), because a single nudge is too easy to scroll past. The first
+version warned once per band, and real sessions took the AMBER warning and still
+drifted 60–100k beyond it before handing over; the CRITICAL block behaved the same
+way, stopping one tool call and then letting the session run on. Now the block
+re-asserts on every call while you are over the line.
+
+Each repeat says how much context has been added since the last warning, and — once
+you have three handovers on record — where your own handovers *actually* fire versus
+AMBER:
+
+```
+CONTEXT GUARD - RED (198,061 tokens in context). 30k more since the last warning,
+and all of it is re-sent every turn.
+...
+Your last 8 handovers fired at a median of 188k - 78k past AMBER (110k). That
+overshoot is the expensive part. Hand over near AMBER, not at the block.
+```
+
+Writing a handover for the session lifts the block: the guard keeps telling Claude to
+stop and switch sessions, but stops blocking, so complying with the guard can never
+wedge the turn. Bands re-arm if context drops after a `/clear` or a compaction.
+Between checks the guard costs one `stat()` call — it only re-reads the transcript
+once it has grown by 40 KB.
 
 **`/handover`.** Claude writes a document covering the goal, what is done, what is
 in flight, ordered next steps, the decisions and constraints that took the whole
@@ -183,7 +204,9 @@ python3 ~/.claude/handover/bin/ctx.py install --project /path/to/repo
 |---|---|---|
 | `thresholds` | 110k / 160k / 220k | amber, red, critical |
 | `pct_of_window` | 0.70 / 0.85 | percentage trips, applied only to a *known* window |
-| `block_at_critical` | `true` | actually block the tool call at critical |
+| `block_at_critical` | `true` | block the tool call at critical, on every call until handover |
+| `block_at_red` | `false` | set `true` to block at red as well |
+| `renotify_tokens` | 25k | re-warn after this much further growth inside a band |
 | `projection_turns` | 20 | turns the savings projection assumes |
 | `share_dir` | `""` | shared handover folder for multi-machine use |
 | `pricing` | Opus/Sonnet/Haiku list | verify against anthropic.com/pricing |
