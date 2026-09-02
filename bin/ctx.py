@@ -15,6 +15,7 @@ Subcommands:
   list          list recent handovers (all machines, if a share dir is set)
   show          print a handover doc
   consume       mark a handover as picked up
+  savings       what a handover here would save; --all for what past ones did
   report        token-waste report across local transcripts
   install       merge hooks + statusLine into a settings.json
   doctor        verify the install
@@ -31,7 +32,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 HOME = Path.home()
 ROOT = Path(os.environ.get("CLAUDE_HANDOVER_ROOT", str(HOME / ".claude" / "handover")))
 STATE_DIR = ROOT / "state"
@@ -806,9 +807,288 @@ def render_savings(sv: dict) -> str:
     return "\n".join(L)
 
 
+# ------------------------------------------------------- realized savings ---
+# `savings` projects what a handover about to be written would save. `savings
+# --all` answers the other question: what did the handovers already written
+# actually save, measured against the sessions that picked them up.
+
+HANDOVER_RE = re.compile(rb"HANDOVER-\d{8}-\d{4}")
+
+
+def parse_handover(path: Path) -> dict | None:
+    """Frontmatter of one handover doc, or None if it is not one."""
+    try:
+        text = path.read_text(errors="replace")
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    m = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+    if not m:
+        return None
+    fm = dict(re.findall(r"^([a-z_]+):\s*(.*)$", m.group(1), re.M))
+    try:
+        ctx = int(fm.get("context_at_handover", "0"))
+    except ValueError:
+        return None
+    if ctx <= 0:
+        return None
+    stem = re.match(r"HANDOVER-\d{8}-\d{4}", path.stem)
+    return {"path": path, "name": path.stem, "id": stem.group(0) if stem else path.stem,
+            "project": fm.get("project") or path.parent.name,
+            "session": fm.get("session", ""), "model": fm.get("model", ""),
+            "written": fm.get("written", ""), "title": fm.get("handover", ""),
+            "consumed_session": fm.get("consumed_session", ""),
+            "context": ctx, "doc_tokens": estimate_tokens(text), "mtime": mtime}
+
+
+def all_transcripts(cfg: dict) -> list[Path]:
+    dirs = [PROJECTS] + [Path(os.path.expanduser(d))
+                         for d in cfg.get("extra_transcript_dirs", [])]
+    out: list[Path] = []
+    for base in dirs:
+        if base.is_dir():
+            out.extend(base.glob("*/*.jsonl"))
+    return out
+
+
+def transcript_cwd(path: Path) -> str:
+    """The project directory a transcript belongs to, from its first records."""
+    try:
+        with open(path, "rb") as f:
+            for _ in range(8):
+                raw = f.readline()
+                if not raw:
+                    break
+                if b'"cwd"' not in raw:
+                    continue
+                try:
+                    d = json.loads(raw)
+                except Exception:
+                    continue
+                if d.get("cwd"):
+                    return str(d["cwd"])
+    except OSError:
+        pass
+    return ""
+
+
+def discover_handovers(cfg: dict, cwd: str, transcripts: list[Path]) -> list[dict]:
+    """Every handover doc reachable from here: this project, the share folder,
+    the local fallback, and every project any transcript was recorded in."""
+    dirs: list[Path] = [Path(cwd) / ".claude" / "handover"]
+    sd = share_dir(cfg)
+    if sd and sd.is_dir():
+        dirs.extend(p for p in sd.iterdir() if p.is_dir())
+    fallback = ROOT / "docs"
+    if fallback.is_dir():
+        dirs.extend(p for p in fallback.iterdir() if p.is_dir())
+    seen_cwd: set[str] = set()
+    for t in transcripts:
+        c = transcript_cwd(t)
+        if c and c not in seen_cwd:
+            seen_cwd.add(c)
+            dirs.append(Path(c) / ".claude" / "handover")
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for p in sorted(d.glob("HANDOVER-*.md")):
+            h = parse_handover(p)
+            if not h:
+                continue
+            key = (h["project"], h["id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(h)
+    out.sort(key=lambda h: h["mtime"])
+    return out
+
+
+def scan_refs(path: Path) -> dict:
+    """One pass over a transcript: its fresh-start baseline, how many turns it
+    has taken, and which handover docs it mentions - each recorded with the turn
+    it was first seen on, so a session that merely talks about a doc later is not
+    mistaken for one that was seeded by it."""
+    baseline = 0
+    turns = 0
+    peak = 0
+    first = ""
+    refs: dict[str, int] = {}
+    try:
+        with open(path, "rb") as f:
+            for raw in f:
+                if b"HANDOVER-" in raw:
+                    for m in HANDOVER_RE.findall(raw):
+                        refs.setdefault(m.decode(), turns)
+                if b'"usage"' not in raw:
+                    continue
+                try:
+                    d = json.loads(raw)
+                except Exception:
+                    continue
+                if d.get("isSidechain"):
+                    continue
+                u = (d.get("message") or {}).get("usage") or {}
+                tot = ((u.get("input_tokens") or 0)
+                       + (u.get("cache_read_input_tokens") or 0)
+                       + (u.get("cache_creation_input_tokens") or 0))
+                if tot <= 0:
+                    continue
+                turns += 1
+                peak = max(peak, tot)
+                if not baseline:
+                    baseline = tot
+                    first = d.get("timestamp") or ""
+    except OSError:
+        pass
+    return {"baseline": baseline, "turns": turns, "peak": peak, "first": first,
+            "refs": refs, "session": path.stem}
+
+
+def realized_savings(cfg: dict, cwd: str, days: int | None = None,
+                     window: int = 3) -> dict:
+    transcripts = all_transcripts(cfg)
+    docs = discover_handovers(cfg, cwd, transcripts)
+    if days:
+        cutoff = time.time() - days * 86400
+        docs = [h for h in docs if h["mtime"] >= cutoff]
+    if not docs:
+        return {"rows": [], "unused": [], "total": 0, "usd": 0.0, "docs": 0}
+
+    # only transcripts that could possibly have picked one of these up
+    oldest = min(h["mtime"] for h in docs) - 86400
+    by_name: dict[str, list[dict]] = {}
+    for t in transcripts:
+        try:
+            if t.stat().st_mtime < oldest:
+                continue
+        except OSError:
+            continue
+        s = scan_refs(t)
+        if not s["turns"] or not s["refs"]:
+            continue
+        for name in s["refs"]:
+            by_name.setdefault(name, []).append(s)
+
+    # A doc is "picked up" by the earliest-starting session that read it within
+    # its first few turns and did not write it. A session is credited once, to
+    # the latest doc it read - otherwise a chain of superseded handovers counts
+    # the same session's turns several times.
+    claims: dict[str, dict] = {}
+    for h in docs:
+        cands = [s for s in by_name.get(h["id"], [])
+                 if h["session"] and not s["session"].startswith(h["session"])
+                 and s["refs"].get(h["id"], window + 1) <= window]
+        if h["consumed_session"]:
+            exact = [s for s in by_name.get(h["id"], [])
+                     if s["session"].startswith(h["consumed_session"])]
+            cands = exact or cands
+        if not cands:
+            continue
+        s = min(cands, key=lambda s: s["first"])
+        prev = claims.get(s["session"])
+        if prev is None or h["mtime"] > prev["handover"]["mtime"]:
+            claims[s["session"]] = {"handover": h, "successor": s}
+
+    rows = []
+    total = 0
+    usd = 0.0
+    for c in claims.values():
+        h, s = c["handover"], c["successor"]
+        per_turn = max(0, h["context"] - s["baseline"])
+        saved = per_turn * s["turns"]
+        rate = rates_for(h["model"], cfg)["cache_read"]
+        total += saved
+        usd += saved * rate / 1_000_000
+        rows.append({"handover": h, "successor": s, "per_turn": per_turn,
+                     "saved": saved, "usd": saved * rate / 1_000_000})
+    rows.sort(key=lambda r: r["handover"]["mtime"])
+    taken = {r["handover"]["id"] for r in rows}
+    unused = [h for h in docs if h["id"] not in taken]
+    return {"rows": rows, "unused": unused, "total": total, "usd": usd, "docs": len(docs)}
+
+
+def render_realized(res: dict) -> str:
+    L: list[str] = []
+    rows = res["rows"]
+    if not res["docs"]:
+        return "No handover docs found. Write one with /handover first."
+    if not rows:
+        L.append("No handover has been picked up by a fresh session yet.")
+        L.append(f"{len(res['unused'])} written and waiting.")
+        return "\n".join(L)
+    L.append(f"Realized handover savings - {len(rows)} of {res['docs']} handovers picked up\n")
+    L.append(f"  {'project':<16} {'written':<11} {'ctx@handover':>12} {'fresh start':>11} "
+             f"{'turns':>6} {'saved':>9}")
+    for r in rows:
+        h, s = r["handover"], r["successor"]
+        when = h["written"][5:16] if len(h["written"]) > 15 else h["written"]
+        L.append(f"  {h['project'][:16]:<16} {when:<11} {h['context']:>12,} "
+                 f"{s['baseline']:>11,} {s['turns']:>6} {r['saved']/1e6:>8.1f}M")
+    L.append("")
+    L.append(f"  tokens not re-sent : {res['total']/1e6:,.1f}M")
+    L.append(f"  at list price      : ${res['usd']:,.2f} (cache-read rate)")
+    if res["unused"]:
+        L.append("")
+        L.append(f"  not traced to a fresh session ({len(res['unused'])}):")
+        for h in res["unused"][-6:]:
+            when = h["written"][5:16] if len(h["written"]) > 15 else h["written"]
+            L.append(f"    {h['project'][:16]:<16} {when:<11} ctx {h['context']:,}")
+        L.append("    (superseded by a later handover, still waiting, or picked up")
+        L.append("     without the doc being named - run `consume` to make it exact)")
+    L.append("")
+    L.append("  A floor, not a bill. Each row assumes the old session's context would have")
+    L.append("  stayed flat at its handover size; in practice it kept growing, so the real")
+    L.append("  number is higher. A session counts as a pickup only if it named the doc in")
+    L.append("  its first few turns, and is credited once, to the newest doc it read.")
+    L.append("  On a subscription the currency is your usage allowance, not dollars.")
+    return "\n".join(L)
+
+
+def savings_all(args: list[str], cfg: dict, cwd: str) -> int:
+    days = None
+    window = 3
+    for i, a in enumerate(args):
+        if a == "--days" and i + 1 < len(args):
+            days = int(args[i + 1])
+        if a == "--window" and i + 1 < len(args):
+            window = int(args[i + 1])
+    res = realized_savings(cfg, cwd, days, window)
+    if "--json" in args:
+        print(json.dumps({
+            "total_tokens": res["total"],
+            "total_usd": round(res["usd"], 2),
+            "handovers": res["docs"],
+            "picked_up": len(res["rows"]),
+            "rows": [{"project": r["handover"]["project"],
+                      "written": r["handover"]["written"],
+                      "doc": r["handover"]["id"],
+                      "context_at_handover": r["handover"]["context"],
+                      "fresh_start": r["successor"]["baseline"],
+                      "successor": r["successor"]["session"][:8],
+                      "turns": r["successor"]["turns"],
+                      "saved_per_turn": r["per_turn"],
+                      "saved_tokens": r["saved"],
+                      "saved_usd": round(r["usd"], 2)} for r in res["rows"]],
+            "waiting": [{"project": h["project"], "written": h["written"],
+                         "doc": h["id"], "context_at_handover": h["context"]}
+                        for h in res["unused"]],
+        }, indent=2))
+    else:
+        print(render_realized(res))
+    return 0
+
+
 def cmd_savings(args: list[str]) -> int:
     cfg = load_config()
     cwd = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    for i, a in enumerate(args):
+        if a == "--cwd" and i + 1 < len(args):
+            cwd = args[i + 1]
+    if "--all" in args:
+        return savings_all(args, cfg, cwd)
     doc = ""
     turns = None
     path = None
@@ -955,8 +1235,18 @@ def cmd_consume(args: list[str]) -> int:
         print("not found:", p, file=sys.stderr)
         return 1
     txt = p.read_text()
+    sid = ""
+    for i, a in enumerate(args):
+        if a == "--session" and i + 1 < len(args):
+            sid = args[i + 1]
+    if not sid:
+        m = re.search(r"^cwd:\s*(.+)$", txt[:2000], re.M)
+        t = find_transcript((m.group(1).strip() if m else None) or os.getcwd(), None)
+        sid = t.stem if t else ""
     txt = re.sub(r"^status:\s*pending", f"status: consumed by {MACHINE} at {now_iso()}",
                  txt, count=1, flags=re.M)
+    if sid and not re.search(r"^consumed_session:", txt, re.M):
+        txt = re.sub(r"^(status:.*)$", rf"\1\nconsumed_session: {sid}", txt, count=1, flags=re.M)
     p.write_text(txt)
     print("marked consumed:", p)
     return 0

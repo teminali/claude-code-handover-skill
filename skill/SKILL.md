@@ -128,12 +128,18 @@ it taken so it stops being offered at session start:
 python3 ~/.claude/handover/bin/ctx.py consume <path-to-handover.md>
 ```
 
+This also stamps the consuming session id onto the doc, which is what lets
+`ctx.py savings --all` report exactly what the handover saved rather than guessing.
+Run it even when the doc was offered automatically at session start.
+
 ## Other commands
 
 | Command | Use |
 |---|---|
 | `ctx.py status` | context tokens, band, thresholds for this session |
 | `ctx.py report --days 7` | where tokens actually went, across all local sessions |
+| `ctx.py savings` | what handing over right now would save from here |
+| `ctx.py savings --all` | what the handovers already written actually saved |
 | `ctx.py list` | handovers for this project, from every machine |
 | `ctx.py show` | print the newest handover |
 | `ctx.py doctor` | verify hooks, statusline, config, share dir |
