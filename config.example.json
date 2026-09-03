@@ -17,6 +17,7 @@
   "share_dir": "",
   "extra_transcript_dirs": [],
   "clipboard": true,
+  "auto_consume": true,
   "assume_window": 0,
   "projection_turns": 20,
   "pricing": {

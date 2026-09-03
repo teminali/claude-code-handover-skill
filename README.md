@@ -103,6 +103,13 @@ The start-here prompt lands on your clipboard. Paste it into a new session.
 The skill's hard rule: reference `path:line`, never paste file contents. A handover
 that inlines code costs as much as the session it replaces.
 
+**`/clear` stays yours.** It is a built-in CLI command — not a tool, and not reachable
+from a hook — so Claude cannot run it. The transcript being reset is the one it is
+running inside. Everything else is built so that forgetting it costs tokens and nothing
+more: writing a handover supersedes the ones it replaces, and SessionStart marks a doc
+consumed as it offers it. A project can no longer accumulate a queue of `pending`
+handovers that were silently picked up months ago.
+
 **Savings, measured not guessed.** Every handover ends with:
 
 ```
@@ -209,6 +216,7 @@ python3 ~/.claude/handover/bin/ctx.py install --project /path/to/repo
 | `renotify_tokens` | 25k | re-warn after this much further growth inside a band |
 | `projection_turns` | 20 | turns the savings projection assumes |
 | `share_dir` | `""` | shared handover folder for multi-machine use |
+| `auto_consume` | `true` | mark a handover consumed when SessionStart offers it; `false` to claim it by hand |
 | `pricing` | Opus/Sonnet/Haiku list | verify against anthropic.com/pricing |
 | `enabled` | `true` | set `false` to switch the whole guard off |
 
