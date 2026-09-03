@@ -22,6 +22,8 @@ Subcommands:
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -57,6 +59,10 @@ DEFAULT_CONFIG = {
     "share_dir": "",             # e.g. ~/Library/Mobile Documents/com~apple~CloudDocs/claude-handovers
     "extra_transcript_dirs": [],
     "clipboard": True,
+    # Mark a handover consumed the moment SessionStart offers it, rather than
+    # waiting for the agent to run `consume` by hand. Set false to go back to
+    # an explicit pickup.
+    "auto_consume": True,
     "assume_window": 0,   # 0 = auto-detect; pin to 1000000 or 200000 to be explicit
     "projection_turns": 20,   # turns the session would plausibly have continued
     "pricing": {
@@ -461,18 +467,64 @@ def cmd_sessionstart(payload: dict) -> int:
         return 0
     d = docs[0]
     age_h = (time.time() - d["mtime"]) / 3600.0
+    # Being handed the doc is the pickup. Waiting for the agent to remember a
+    # follow-up command left every offered handover stranded as `pending`, which
+    # is how a project ends up with a queue of them. The doc is not deleted, so
+    # an unrelated session marking one taken costs nothing but a `ctx.py list`.
+    auto = bool(cfg.get("auto_consume", True))
+    if auto:
+        try:
+            # cmd_consume reports on stdout, which in a hook is the JSON channel.
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_consume([d["path"], "--session", payload.get("session_id") or ""])
+        except Exception:
+            auto = False
+    follow = (
+        "It has been marked consumed already, so nothing further is needed to claim it."
+        if auto else
+        "If this session continues that work, read it first and then run "
+        "`python3 ~/.claude/handover/bin/ctx.py consume " + d["path"] + "`."
+    )
     note = (
         f"A session handover is waiting for this project: {d['path']} "
         f"(written {age_h:.0f}h ago on machine '{d['machine']}'). "
-        "If this session continues that work, read it first and then run "
-        "`python3 ~/.claude/handover/bin/ctx.py consume " + d["path"] + "`. "
-        "If this is unrelated new work, ignore it."
+        + follow +
+        " If this is unrelated new work, ignore it — the doc stays on disk and "
+        "`ctx.py list` still shows it."
     )
     emit({
         "systemMessage": f"handover pending: {Path(d['path']).name}",
         "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": note},
     })
     return 0
+
+
+def handover_stamp(name: str) -> str:
+    """The timestamp that identifies a handover across its copies.
+
+    A doc mirrored to the shared folder is written as
+    `HANDOVER-<stamp>-<machine>.md` beside the project's own
+    `HANDOVER-<stamp>.md`. They are one handover, and treating them as two is
+    how a project accumulates a queue that never drains: consuming either copy
+    left the other pending, so the next session was offered it all over again.
+    """
+    m = re.match(r"HANDOVER-(\d{8}-\d{4})", name)
+    return m.group(1) if m else name
+
+
+def handover_copies(cfg: dict, cwd: str, stamp: str) -> list[Path]:
+    """Every file on this machine that is the same handover as `stamp`."""
+    found: list[Path] = []
+    dirs = [handover_dir(cwd)]
+    sd = share_dir(cfg)
+    if sd:
+        dirs.append(sd / project_slug(cwd))
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for q in d.glob(f"HANDOVER-{stamp}*.md"):
+            found.append(q)
+    return found
 
 
 def pending_handovers(cfg: dict, cwd: str, max_age_hours: float = 48) -> list[dict]:
@@ -485,24 +537,59 @@ def pending_handovers(cfg: dict, cwd: str, max_age_hours: float = 48) -> list[di
     for d in dirs:
         if not d.is_dir():
             continue
-        for p in d.glob("HANDOVER-*.md"):
-            if p.name in seen:
+        for p in sorted(d.glob("HANDOVER-*.md")):
+            stamp = handover_stamp(p.name)
+            if stamp in seen:
                 continue
             try:
                 head = p.read_text(errors="replace")[:1200]
             except Exception:
                 continue
-            if re.search(r"^status:\s*consumed", head, re.M):
+            if re.search(r"^status:\s*(consumed|superseded)", head, re.M):
                 continue
             age = (time.time() - p.stat().st_mtime) / 3600.0
             if age > max_age_hours:
                 continue
             m = re.search(r"^machine:\s*(\S+)", head, re.M)
-            seen.add(p.name)
+            seen.add(stamp)
             out.append({"path": str(p), "mtime": p.stat().st_mtime,
                         "machine": m.group(1) if m else "?"})
     out.sort(key=lambda x: -x["mtime"])
     return out
+
+
+def supersede_pending(cfg: dict, cwd: str, keep_stamp: str) -> list[str]:
+    """Retire the handovers this one replaces.
+
+    A doc was only ever marked consumed by the session that picked it up, and
+    that only happened if someone actually started a fresh one. Nothing else
+    ever expired them, so a skipped `/clear` did not merely cost tokens — it
+    stranded the doc, and every later session was offered work that had long
+    since moved on. Writing a newer handover for the same project is proof the
+    older one is finished with, so retire it here rather than waiting for a
+    pickup that may never come.
+    """
+    retired: list[str] = []
+    for d in pending_handovers(cfg, cwd, max_age_hours=float("inf")):
+        stamp = handover_stamp(Path(d["path"]).name)
+        if stamp == keep_stamp:
+            continue
+        # Retire the mirror alongside the project copy; one without the other
+        # leaves the handover half-pending and it gets offered again.
+        for path in handover_copies(cfg, cwd, stamp):
+            try:
+                txt = path.read_text()
+                new = re.sub(
+                    r"^status:\s*pending",
+                    f"status: superseded by HANDOVER-{keep_stamp}.md at {now_iso()}",
+                    txt, count=1, flags=re.M,
+                )
+                if new != txt:
+                    path.write_text(new)
+                    retired.append(str(path))
+            except Exception:
+                continue
+    return retired
 
 
 # ------------------------------------------------------------- status line ---
@@ -1261,6 +1348,9 @@ def cmd_write(args: list[str]) -> int:
         mirror.write_text(doc)
         written.append(str(mirror))
 
+    # Everything this doc replaces is finished with by definition.
+    retired = supersede_pending(cfg, cwd, stamp)
+
     # pull the start-here prompt out of the first fenced block after the heading
     prompt = ""
     m = re.search(r"#+\s*Start-?here prompt.*?```(?:\w+)?\n(.*?)```", doc, re.S | re.I)
@@ -1290,6 +1380,8 @@ def cmd_write(args: list[str]) -> int:
 
     for w in written:
         print(w)
+    for r in retired:
+        print("superseded:", r)
     if savings:
         print()
         print(render_savings(savings))
@@ -1343,12 +1435,34 @@ def cmd_consume(args: list[str]) -> int:
         m = re.search(r"^cwd:\s*(.+)$", txt[:2000], re.M)
         t = find_transcript((m.group(1).strip() if m else None) or os.getcwd(), None)
         sid = t.stem if t else ""
-    txt = re.sub(r"^status:\s*pending", f"status: consumed by {MACHINE} at {now_iso()}",
-                 txt, count=1, flags=re.M)
-    if sid and not re.search(r"^consumed_session:", txt, re.M):
-        txt = re.sub(r"^(status:.*)$", rf"\1\nconsumed_session: {sid}", txt, count=1, flags=re.M)
-    p.write_text(txt)
-    print("marked consumed:", p)
+    def mark(doc: Path) -> bool:
+        try:
+            body = doc.read_text()
+        except Exception:
+            return False
+        out = re.sub(r"^status:\s*pending", f"status: consumed by {MACHINE} at {now_iso()}",
+                     body, count=1, flags=re.M)
+        if sid and not re.search(r"^consumed_session:", out, re.M):
+            out = re.sub(r"^(status:.*)$", rf"\1\nconsumed_session: {sid}", out, count=1, flags=re.M)
+        if out == body:
+            return False
+        doc.write_text(out)
+        return True
+
+    # The same handover exists as a project copy and, when a shared folder is
+    # configured, a mirror under a different name. Marking one and leaving the
+    # other pending is what kept re-offering work that had already been picked
+    # up, so retire every copy together.
+    cfg = load_config()
+    m_cwd = re.search(r"^cwd:\s*(.+)$", txt[:2000], re.M)
+    targets = {p.resolve()}
+    if m_cwd:
+        for q in handover_copies(cfg, m_cwd.group(1).strip(), handover_stamp(p.name)):
+            targets.add(q.resolve())
+
+    for doc in sorted(targets):
+        if mark(doc):
+            print("marked consumed:", doc)
     return 0
 
 

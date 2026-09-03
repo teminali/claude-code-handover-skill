@@ -15,7 +15,7 @@ transcript.**
 
 - The context guard fired RED or CRITICAL (do it now, before any more tool calls).
 - Guard fired AMBER and the user is about to start something new.
-- The user is switching to an unrelated task — hand over, then `/clear`.
+- The user is switching to an unrelated task — hand over, then tell them to `/clear`.
 - You notice you are re-reading files you already read, or forgetting earlier decisions.
 
 ## Procedure
@@ -109,28 +109,39 @@ This stamps machine, session, branch, model and context size onto the doc, saves
 the shared folder if one is configured (so another computer can pick it up), and copies
 the start-here prompt to the clipboard.
 
-### 5. Tell the user, briefly
+### 5. Hand off, and stop
 
-Three lines, no more:
+**You cannot `/clear`.** It is a built-in CLI command, not a tool, and no hook can invoke
+one either — the transcript being reset is the one you are running inside. That step is
+the user's and always will be, so the rest of the design assumes they will sometimes
+forget: docs supersede their predecessors and get consumed on sight, which makes a missed
+`/clear` merely expensive rather than something that strands the doc forever.
+
+Say three lines, no more:
 
 1. Where the doc is.
 2. That the start-here prompt is on the clipboard.
-3. `/clear` (same project) or a new chat window, then paste.
+3. That `/clear` (same project), or a new chat window, then paste, is the next move.
 
-Then **stop**. Do not begin new work in this session.
+End on a bare `/clear` so it is one keystroke away rather than buried in prose. Then
+**stop**. Do not begin new work in this session — a handover that is written and then
+worked past is stale, and the next session will act on it as though it were not.
 
 ## Picking a handover up
 
-In the fresh session: read the doc, confirm the next step in one line, and start. Then mark
-it taken so it stops being offered at session start:
+SessionStart marks the doc consumed as it offers it, so there is normally nothing to run:
+read it, confirm the next step in one line, and start. Being handed the doc is the pickup.
+
+Set `"auto_consume": false` in `config.json` to claim it by hand instead:
 
 ```bash
 python3 ~/.claude/handover/bin/ctx.py consume <path-to-handover.md>
 ```
 
-This also stamps the consuming session id onto the doc, which is what lets
-`ctx.py savings --all` report exactly what the handover saved rather than guessing.
-Run it even when the doc was offered automatically at session start.
+Either way the consuming session id is stamped onto the doc, which is what lets
+`ctx.py savings --all` report what the handover actually saved rather than guessing.
+Consuming retires *every* copy — the project's and the shared folder's mirror — so it
+cannot resurface at the next session start.
 
 ## Other commands
 
