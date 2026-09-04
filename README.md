@@ -243,3 +243,7 @@ Or restore a backup: `~/.claude/settings.json.bak-*`.
 ## Licence
 
 GPL-3.0. See [LICENSE](LICENSE).
+
+## Support
+
+If this saved you time, [a coffee's worth of crypto](DONATE.md) is a good way to say so. It stays free either way.
